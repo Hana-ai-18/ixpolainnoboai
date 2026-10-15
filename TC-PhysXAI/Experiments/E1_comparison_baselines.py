@@ -54,10 +54,20 @@ def vanilla_gradient_saliency(
     bl_g[11] = img_g
 
     with torch.enable_grad():
-        cond = model.context_encoder(bl_g)
+        # TC-XFlow API: model.encoder(batch, hard_score=...) / model.velocity(z, t, cond)
+        bl_g = [t.to(device) if torch.is_tensor(t) else t for t in bl_g]
+        try:
+            from Model.flow_matching_model import hard_score_from_obs
+            h_score = hard_score_from_obs(
+                bl_g[0][:, :, :2],
+                weight_logits=model.hard_score_weight_logits,
+            )
+            cond = model.encoder(bl_g, hard_score=h_score)
+        except Exception:
+            cond = model.encoder(bl_g)
         # Use first ensemble member
         z0   = torch.randn(img_obs.shape[0], 12, 2, device=device)
-        v    = model.velocity_transformer(z0, torch.zeros(img_obs.shape[0], device=device), cond)
+        v    = model.velocity(z0, torch.zeros(img_obs.shape[0], device=device), cond)
         loss = v.pow(2).sum()
         loss.backward()
 
