@@ -61,7 +61,7 @@ def run_e5(
         try:
             # Compute IG attribution once
             s_result = spatial.compute(bl_dev, detect_objects=False)
-            ig_attr  = torch.tensor(s_result["ig_attr"]) if "ig_attr" in s_result else None
+            ig_attr  = torch.as_tensor(s_result["ig_attr"]).detach().clone() if "ig_attr" in s_result else None
             if ig_attr is None:
                 continue
 

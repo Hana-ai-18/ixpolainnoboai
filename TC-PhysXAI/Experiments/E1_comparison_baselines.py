@@ -157,7 +157,11 @@ def run_e1(
         try:
             # ─── TC-PhysXAI IG ─────────────────────────────────────────────
             result_ig = spatial.compute(bl_dev, detect_objects=False)
-            ig_attr   = torch.tensor(result_ig["ig_attr"])  # [B, 13, T, H, W]
+            _ig = result_ig["ig_attr"]
+            ig_attr = _ig.detach().clone() if torch.is_tensor(_ig) else torch.as_tensor(_ig)  # [B, 13, T, H, W]
+            _ig_abs = ig_attr.abs().float().cpu().numpy()
+            _ig_p   = _ig_abs / (_ig_abs.sum() + 1e-8)
+            ig_complexity = float(-np.sum(_ig_p * np.log(_ig_p + 1e-8)))
 
             fid_ig = fidelity.compute(bl_dev, ig_attr, K=K, top_k=top_k)
 
@@ -168,10 +172,7 @@ def run_e1(
                 "precision_F": fid_ig.precision_f,
                 "recall_F": fid_ig.recall_f,
                 "uncertainty_F": fid_ig.uncertainty_f,
-                "complexity": float(-np.sum(
-                    np.abs(result_ig["ig_attr"]) / (np.abs(result_ig["ig_attr"]).sum() + 1e-8)
-                    * np.log(np.abs(result_ig["ig_attr"]) / (np.abs(result_ig["ig_attr"]).sum() + 1e-8) + 1e-8)
-                )),
+                "complexity": ig_complexity,
                 "CRPS_baseline": fid_ig.crps_baseline,
             })
 

@@ -88,7 +88,8 @@ def run_e4(
             ig_attr = s_res.get("ig_attr", None)
             # Spatial entropy: distribution over channels
             if ig_attr is not None:
-                ch_w = np.abs(ig_attr).mean(axis=(0, 2, 3, 4))  # [13]
+                _ig_np = ig_attr.detach().abs().float().cpu().numpy() if torch.is_tensor(ig_attr) else np.abs(np.asarray(ig_attr))
+                ch_w = _ig_np.mean(axis=(0, 2, 3, 4))  # [13]
                 ch_w = ch_w / (ch_w.sum() + 1e-8)
                 spatial_entropy = float(-np.sum(ch_w * np.log(ch_w + 1e-8)))
             else:
