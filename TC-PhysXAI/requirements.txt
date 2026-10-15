@@ -1,0 +1,24 @@
+# TC-PhysXAI — Requirements
+# Compatible with Kaggle Python 3.10+ environment (GPU P100/T4)
+
+# Core ML
+torch>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.0.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Trajectory / time-series distance
+# (dtw_python used internally via pure-numpy fallback in utils.py)
+
+# Optional: faster DTW (install if available)
+# dtaidistance>=2.3.0
+
+# Already available on Kaggle (no install needed):
+# torch, numpy, scipy, pandas, matplotlib, seaborn
+
+# If running locally:
+# pip install torch numpy scipy pandas matplotlib seaborn
