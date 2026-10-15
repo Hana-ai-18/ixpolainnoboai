@@ -37,7 +37,7 @@ TC_XFLOW_ROOT = Path("/kaggle/working/Tropical_Typhoon_Architecture")
 sys.path.insert(0, str(TC_XFLOW_ROOT))
 
 from PhysXAI import SpatialAttributor, ProbabilisticFidelity
-from PhysXAI.utils import crps_ensemble_fast
+from PhysXAI.utils import crps_ensemble_fast, seed_crn
 
 # ─── Helper: Vanilla gradient saliency ────────────────────────────────────────
 
@@ -88,6 +88,7 @@ def lime_attribution(
 
     # Baseline CRPS
     with torch.no_grad():
+        seed_crn(0)
         _, _, all_traj = model.sample(batch_list, num_ensemble=10, use_speed_calibration=False)
         pred_traj = batch_list[1].to(device)
         T_pred = min(all_traj.shape[1], pred_traj.shape[0])
@@ -105,6 +106,7 @@ def lime_attribution(
             bl_p[11] = img_p
 
             with torch.no_grad():
+                seed_crn(0)
                 _, _, all_t = model.sample(bl_p, num_ensemble=10, use_speed_calibration=False)
                 crps_p = crps_ensemble_fast(all_t[:, :T_pred], pred_traj[:T_pred]).mean()
             crps_sum += float(crps_p - crps_base)
@@ -127,6 +129,7 @@ def run_e1(
     K: int = 30,
     top_k: int = 3,
     n_storms: int = 20,
+    n_random: int = 3,
 ) -> pd.DataFrame:
     """Run E1: XAI method comparison.
 
@@ -147,6 +150,7 @@ def run_e1(
     spatial   = SpatialAttributor(model, device)
 
     rows = []
+    n_failed = 0
     storm_list = test_batch_list[:n_storms]
 
     for s_idx, bl in enumerate(storm_list):
@@ -206,19 +210,70 @@ def run_e1(
                 "CRPS_baseline": fid_lime.crps_baseline,
             })
 
+            # ─── Random channels (sanity floor: any real method must beat this) ──
+            rnd = []
+            for r in range(max(1, n_random)):
+                g = torch.Generator().manual_seed(1000 * s_idx + r)
+                ch_score = torch.rand(ig_attr.shape[1], generator=g)
+                rand_attr = ch_score.view(1, -1, 1, 1, 1).expand_as(ig_attr).clone()
+                rnd.append(fidelity.compute(bl_dev, rand_attr, K=K, top_k=top_k))
+            rows.append({
+                "storm": s_idx,
+                "method": f"Random channels (mean of {max(1, n_random)})",
+                "H_mean_F": float(np.mean([f.h_mean_f for f in rnd])),
+                "precision_F": float(np.mean([f.precision_f for f in rnd])),
+                "recall_F": float(np.mean([f.recall_f for f in rnd])),
+                "uncertainty_F": float(np.mean([f.uncertainty_f for f in rnd])),
+                "complexity": float("nan"),
+                "CRPS_baseline": float(np.mean([f.crps_baseline for f in rnd])),
+            })
+
         except Exception as e:
-            print(f"  [E1] Storm {s_idx} failed: {e}")
+            import traceback
+            n_failed += 1
+            print(f"  [E1] Storm {s_idx} FAILED: {e}\n{traceback.format_exc()}")
             continue
 
+    if not rows:
+        raise RuntimeError(f"E1: all {len(storm_list)} storms failed — see tracebacks above")
+    if n_failed:
+        print(f"\n[E1] WARNING: {n_failed}/{len(storm_list)} storms failed; "
+              f"statistics below use {len(storm_list) - n_failed} storms")
+
     df = pd.DataFrame(rows)
+    # h_score_no_u: (0.4 P + 0.4 R) / 0.8 — H_mean_F without the method-independent U term
+    df["h_score_no_u"] = (0.4 * df["precision_F"] + 0.4 * df["recall_F"]) / 0.8
 
     # Summary statistics
-    summary = df.groupby("method")[
-        ["H_mean_F", "precision_F", "recall_F", "uncertainty_F"]
-    ].agg(["mean", "std"])
+    cols = ["H_mean_F", "h_score_no_u", "precision_F", "recall_F", "uncertainty_F"]
+    summary = df.groupby("method")[cols].agg(["mean", "std", "count"])
 
-    print("\n[E1] Summary:")
+    print(f"\n[E1] Summary (std/count are over storms; n_storms_ok = "
+          f"{df['storm'].nunique()}):")
     print(summary.to_string())
+
+    # Paired comparison against the random-channel floor (same storms)
+    rnd_name = [m for m in df["method"].unique() if m.startswith("Random")][0]
+    piv = {c: df.pivot(index="storm", columns="method", values=c) for c in
+           ("h_score_no_u", "precision_F", "recall_F")}
+    rng = np.random.default_rng(0)
+    paired = []
+    for m in df["method"].unique():
+        if m == rnd_name:
+            continue
+        for c in piv:
+            d = (piv[c][m] - piv[c][rnd_name]).dropna().values
+            if len(d) < 2:
+                continue
+            boots = [d[rng.integers(0, len(d), len(d))].mean() for _ in range(2000)]
+            lo, hi = np.percentile(boots, [2.5, 97.5])
+            paired.append({"method": m, "metric": c, "mean_diff_vs_random": float(d.mean()),
+                           "ci95_lo": float(lo), "ci95_hi": float(hi), "n_storms": int(len(d))})
+    paired_df = pd.DataFrame(paired)
+    if len(paired_df):
+        print("\n[E1] Paired difference vs random channels (mean, 95% bootstrap CI over storms):")
+        print(paired_df.round(3).to_string(index=False))
+        paired_df.to_csv(os.path.join(output_dir, "E1_paired_vs_random.csv"), index=False)
 
     df.to_csv(os.path.join(output_dir, "E1_comparison_table.csv"), index=False)
     summary.to_csv(os.path.join(output_dir, "E1_summary.csv"))
@@ -235,7 +290,7 @@ def plot_e1(df: pd.DataFrame, output_dir: str = "results") -> None:
         import matplotlib.pyplot as plt
 
         methods = df["method"].unique()
-        metrics = ["precision_F", "recall_F", "uncertainty_F", "H_mean_F"]
+        metrics = ["precision_F", "recall_F", "uncertainty_F", "H_mean_F"]  # (h_score_no_u is in the CSV)
         colors  = ["#4C72B0", "#DD8452", "#55A868", "#C44E52"]
 
         fig, axes = plt.subplots(1, 4, figsize=(18, 5))
@@ -274,17 +329,14 @@ if __name__ == "__main__":
     print(f"[E1] Device: {device}")
 
     # Load model
-    from Model.flow_matching_model import TCFlowMatching
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    model = TCFlowMatching(**checkpoint.get("model_kwargs", {}))
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device).eval()
+    from PhysXAI.model_io import load_tcxflow
+    model = load_tcxflow(args.checkpoint, device)
 
     # Load test data
     from Model.data.trajectoriesWithMe_unet_training import TrajectoryDataset, seq_collate
     from torch.utils.data import DataLoader
     dataset  = TrajectoryDataset(args.dataset_root, split="test")
-    loader   = DataLoader(dataset, batch_size=4, shuffle=False, collate_fn=seq_collate)
+    loader   = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=seq_collate)
 
     test_batches = []
     for batch in loader:

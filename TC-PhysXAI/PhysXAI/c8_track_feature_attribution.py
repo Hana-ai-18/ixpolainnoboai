@@ -25,9 +25,9 @@ Event / scalar features (single value per case):
   bifurcation_index     : Bimodality of ensemble final-position distribution
   max_speed             : Peak translation speed in forecast window
   mean_speed            : Mean translation speed
-  total_turning         : Accumulated heading change (positive = left/poleward)
-  poleward_displacement : Net northward movement (normalised)
-  zonal_displacement    : Net eastward/westward movement (normalised)
+  total_turning         : Accumulated heading change (positive = clockwise, i.e. NH recurvature W→N→E)
+  poleward_displacement : Net northward movement (degrees latitude)
+  zonal_displacement    : Net eastward/westward movement (degrees longitude)
 
 Attribution Method
 ------------------
@@ -98,6 +98,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
 import numpy as np
+from .geo import norm_to_lonlat, step_enu_km, KM_PER_DEG
 import torch
 
 
@@ -117,7 +118,7 @@ _FEATURE_NAMES = [
     "speed_mean",           # 0  mean translation speed over forecast
     "speed_peak",           # 1  peak translation speed
     "curvature_mean",       # 2  mean absolute curvature (turning rate)
-    "curvature_total",      # 3  total heading change (signed, + = poleward)
+    "curvature_total",      # 3  total heading change (signed, + = clockwise = NH recurvature)
     "spread_mean",          # 4  mean ensemble positional spread
     "spread_final",         # 5  ensemble spread at last forecast step
     "recurvature_prob",     # 6  probability of poleward recurvature
@@ -159,7 +160,7 @@ class TrackFeatures:
     speed_mean:            float
     speed_peak:            float
     curvature_mean:        float     # mean |curvature|
-    curvature_total:       float     # signed total (+ = net left/poleward turn)
+    curvature_total:       float     # signed total (+ = net clockwise turn, i.e. NH recurvature)
     spread_mean:           float
     spread_final:          float
 
@@ -274,30 +275,26 @@ class TrackFeatureExtractor:
 
         Parameters
         ----------
-        all_traj   : [K, T_pred, B, 2]  ensemble trajectories (lat, lon normalised)
+        all_traj   : [K, T_pred, B, 2]  ensemble trajectories, ABSOLUTE normalised (lon_n, lat_n)
         storm_idx  : which storm in the batch to analyse
 
         Returns
         -------
         TrackFeatures
         """
-        # Select storm → [K, T_pred, 2]
+        # Select storm → [K, T_pred, 2]  ABSOLUTE normalised (lon_n, lat_n), 1 unit = 5 deg
         traj = all_traj[:, :, storm_idx, :].cpu().float().numpy()
         K, T, _ = traj.shape
+        ll = norm_to_lonlat(traj)                               # [K, T, 2] (lon°E, lat°N)
 
-        # ── Per-step speed: distance between consecutive steps ───────────────
-        # traj[:, 1:] - traj[:, :-1] → [K, T-1, 2]
-        diff = traj[:, 1:, :] - traj[:, :-1, :]          # [K, T-1, 2]
-        speed_raw = np.sqrt((diff ** 2).sum(-1))           # [K, T-1]
-        speed_mean_over_k = speed_raw.mean(0)              # [T-1]
+        # ── Per-step velocity components in km (east, north) ─────────────────
+        east_km, north_km = step_enu_km(traj)                   # each [K, T-1]
+        speed_raw = np.sqrt(east_km ** 2 + north_km ** 2)       # km per step (6 h)
+        speed_mean_over_k = speed_raw.mean(0)                   # [T-1]
 
-        # ── Heading (degrees clockwise from North) ────────────────────────────
-        # Δlat = diff[:,:,0], Δlon = diff[:,:,1]
-        dlat = diff[:, :, 0]   # [K, T-1]
-        dlon = diff[:, :, 1]   # [K, T-1]
-        # atan2(east, north) → degrees from north, clockwise
-        heading_rad = np.arctan2(dlon, dlat)               # [K, T-1]
-        heading_deg = np.degrees(heading_rad) % 360        # [K, T-1]
+        # ── Heading (compass degrees, clockwise from North) ──────────────────
+        heading_rad = np.arctan2(east_km, north_km)             # [K, T-1]
+        heading_deg = np.degrees(heading_rad) % 360             # [K, T-1]
         heading_mean_over_k = self._circular_mean(heading_deg, axis=0)  # [T-1]
 
         # ── Curvature: rate of heading change ─────────────────────────────────
@@ -308,10 +305,10 @@ class TrackFeatureExtractor:
         curvature_mean_over_k = curv.mean(0)               # [T-2]
 
         # ── Ensemble spread ───────────────────────────────────────────────────
-        # std of lat and lon positions across ensemble members, then combine
-        lat_std = traj[:, :, 0].std(0)    # [T]
-        lon_std = traj[:, :, 1].std(0)    # [T]
-        spread  = np.sqrt(lat_std**2 + lon_std**2)  # [T]
+        # std of the member positions in km (east-west scaled by cos(mean lat))
+        lat_km = ll[:, :, 1].std(0) * KM_PER_DEG                 # [T]
+        lon_km = ll[:, :, 0].std(0) * KM_PER_DEG * np.cos(np.deg2rad(ll[:, :, 1].mean(0)))
+        spread = np.sqrt(lat_km ** 2 + lon_km ** 2)              # [T] km
 
         # ── Scalar summaries ──────────────────────────────────────────────────
         speed_mean  = float(speed_mean_over_k.mean())
@@ -327,8 +324,8 @@ class TrackFeatureExtractor:
         bifurcation_idx   = self._bifurcation_index(traj)
 
         # ── Displacement ──────────────────────────────────────────────────────
-        poleward = float((traj[:, -1, 0] - traj[:, 0, 0]).mean())
-        zonal    = float((traj[:, -1, 1] - traj[:, 0, 1]).mean())
+        poleward = float((ll[:, -1, 1] - ll[:, 0, 1]).mean())   # degrees latitude
+        zonal    = float((ll[:, -1, 0] - ll[:, 0, 0]).mean())   # degrees longitude
 
         return TrackFeatures(
             speed=speed_mean_over_k,
@@ -362,7 +359,7 @@ class TrackFeatureExtractor:
         return (d + 180) % 360 - 180
 
     def _recurvature_probability(self, heading_deg: np.ndarray) -> float:
-        """Fraction of ensemble members that show a poleward turn.
+        """Fraction of ensemble members that show a clockwise (recurving) turn.
 
         Recurvature = net heading change from first half to second half
         of the forecast is > threshold degrees poleward (northward = <180°).
@@ -374,9 +371,9 @@ class TrackFeatureExtractor:
         h_early = self._circular_mean(heading_deg[:, :mid], axis=1)   # [K]
         h_late  = self._circular_mean(heading_deg[:, mid:], axis=1)   # [K]
         delta   = self._angle_diff(h_late, h_early)                   # [K] signed
-        # Poleward turn: heading shifting toward 0° (north) or 360° (north)
-        # Simplification: negative delta means counter-clockwise (toward north in NH)
-        poleward_turn = delta < -self.recurvature_threshold
+        # Compass heading is clockwise from North. In the NH a westward-moving storm that
+        # recurves turns W(270°)→N(360°)→E(90°), i.e. a CLOCKWISE (positive) heading change.
+        poleward_turn = delta > self.recurvature_threshold
         return float(poleward_turn.mean())
 
     def _deceleration_probability(self, speed_raw: np.ndarray) -> float:
@@ -928,7 +925,7 @@ class TrackFeatureAttributor:
         # ── curvature_total ────────────────────────────────────────────────────
         ch_name, ch_val = top_ch["curvature_total"]
         wn_name, wn_val = top_win["curvature_total"]
-        direction = "poleward (recurving)" if base.curvature_total < 0 else "equatorward"
+        direction = "clockwise (recurving)" if base.curvature_total > 0 else "counter-clockwise (equatorward / straightening)"
         summaries["curvature_total"] = (
             f"TOTAL HEADING CHANGE (Σκ={base.curvature_total:+.2f}°, net {direction}): "
             f"The net turning of the track over the forecast window. "
@@ -1067,7 +1064,7 @@ class TrackFeatureAttributor:
                 "ridge weakness. Forecast confidence depends on how well the model "
                 "can resolve the steering flow transition."
             )
-        elif base.recurvature_prob < 0.2 and base.zonal_displacement < -0.1:
+        elif base.recurvature_prob < 0.2 and base.zonal_displacement < -0.5:
             lines.append(
                 "→ STRAIGHT-WEST TRACK. The model predicts continued westward "
                 "translation under a persistent subtropical ridge. "

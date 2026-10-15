@@ -84,20 +84,13 @@ def _extract_context_features(model, batch_list: list, device=None) -> torch.Ten
         device = next(model.parameters()).device
     bl = [t.to(device) if torch.is_tensor(t) else t for t in batch_list]
     obs_traj = bl[0]
+    from Model.flow_matching_model import hard_score_from_obs
     with torch.no_grad():
-        try:
-            from Model.flow_matching_model import hard_score_from_obs
-            h_score = hard_score_from_obs(
-                obs_traj[:, :, :2],
-                weight_logits=model.hard_score_weight_logits,
-            )
-            cond = model.encoder(bl, hard_score=h_score)
-        except (ImportError, AttributeError, Exception):
-            try:
-                cond = model.encoder(bl)
-            except Exception:
-                B = obs_traj.shape[1] if obs_traj.dim() >= 2 else 1
-                cond = torch.zeros(B, 256, device=device)
+        h_score = hard_score_from_obs(
+            obs_traj[:, :, :2],
+            weight_logits=model.hard_score_weight_logits,
+        )
+        cond = model.encoder(bl, hard_score=h_score)
     return cond
 
 
@@ -120,7 +113,7 @@ class FMIntegrationAttribution:
         self,
         model,
         device: torch.device,
-        ddim_steps: int = 20,
+        ddim_steps: Optional[int] = None,   # None -> model.n_inference_steps
         n_ensemble: int = 1,
     ):
         self.model       = model
@@ -143,52 +136,32 @@ class FMIntegrationAttribution:
         vel_magnitude : [ddim_steps]          — mean velocity magnitude
         traj_final    : [T_pred, B, 2]        — final ODE trajectory
         """
-        steps     = self.ddim_steps
+        steps     = self.ddim_steps or self.model.n_inference_steps
         dt        = 1.0 / steps
-        t_vals    = torch.linspace(0, 1 - dt, steps, device=self.device)
 
-        # Initial noise
-        z = torch.randn(B, T_pred, 2, device=self.device)
+        # Initial noise: same law as TCFlowMatching.sample -> N(0, sigma_inference^2)
+        gen = torch.Generator(device=self.device).manual_seed(0)
+        z = torch.randn(B, T_pred, 2, device=self.device, generator=gen) * self.model.sigma_inference
 
-        # Get conditioning context using correct TC-XFlow API
-        cond = _extract_context_features(self.model, batch_list, self.device)
-        # [B, d_cond]
-
+        cond = _extract_context_features(self.model, batch_list, self.device)   # [B, d_cond]
         d_cond     = cond.shape[-1]
         path_attr  = np.zeros((steps, d_cond))
         vel_mag    = np.zeros(steps)
 
-        for i, t_scalar in enumerate(t_vals):
-            # Gradient-based attribution step
+        for i in range(steps):
+            t_vec = torch.full((B,), i * dt, device=self.device)
+
+            # |dL/dc| with L = ||v_t||^2 (sensitivity of the velocity field to the context)
             cond_g = cond.detach().requires_grad_(True)
-            t_vec  = t_scalar.expand(B)
-
-            try:
-                # Correct API: model.velocity(z, t, cond)
+            with torch.enable_grad():
                 v_t = self.model.velocity(z.detach(), t_vec, cond_g)
-            except Exception:
-                # Fallback: skip if architecture differs
-                v_t = torch.zeros_like(z)
-
-            loss = v_t.pow(2).sum()
-            if cond_g.grad is not None:
-                cond_g.grad.zero_()
-            try:
-                loss.backward()
-                grad = cond_g.grad.detach().abs().mean(0).cpu().numpy()
-            except Exception:
-                grad = np.zeros(d_cond)
-
-            path_attr[i] = grad
+                grad = torch.autograd.grad(v_t.pow(2).sum(), cond_g)[0]
+            path_attr[i] = grad.detach().abs().mean(0).cpu().numpy()
             vel_mag[i]   = float(v_t.detach().norm(dim=-1).mean().item())
 
-            # Euler step
+            # Euler step — identical update (and clamp) to sample()
             with torch.no_grad():
-                try:
-                    v_euler = self.model.velocity(z, t_vec, cond)
-                    z = z + dt * v_euler
-                except Exception:
-                    pass  # keep z as-is if step fails
+                z = (z + dt * v_t.detach()).clamp(-3.0, 3.0)
 
         traj_final = z.detach().permute(1, 0, 2).cpu()  # [T_pred, B, 2]
         return path_attr, vel_mag, traj_final.numpy()
@@ -219,38 +192,20 @@ class FMIntegrationAttribution:
         """
         img_obs = batch_list[11] if len(batch_list) > 11 else None
         if img_obs is None or not torch.is_tensor(img_obs):
-            return np.ones(13) / 13.0
+            raise ValueError("C4: batch has no ERA5 tensor at index 11")
 
-        img = img_obs.to(self.device).float()
-        img_g = img.detach().requires_grad_(True)
-
-        # Build minimal batch with gradients on img
-        bl_g = list(batch_list)
+        from Model.flow_matching_model import hard_score_from_obs
+        bl_g = [t.to(self.device) if torch.is_tensor(t) else t for t in batch_list]
+        img_g = bl_g[11].float().detach().requires_grad_(True)
         bl_g[11] = img_g
-
-        try:
-            # Use model.encoder with hard_score — consistent with module2_spatial
-            from Model.flow_matching_model import hard_score_from_obs
-            obs_traj = batch_list[0].to(self.device)
-            with torch.no_grad():
-                h_score = hard_score_from_obs(
-                    obs_traj[:, :, :2],
-                    weight_logits=self.model.hard_score_weight_logits,
-                )
-            with torch.enable_grad():
-                cond_g = self.model.encoder(bl_g, hard_score=h_score)  # [B, d_cond]
-            scalar = cond_g.pow(2).sum()
-            scalar.backward()
-            if img_g.grad is not None:
-                # Sum |grad| over (B, T, H, W) for each channel
-                ch_attr = img_g.grad.detach().abs().mean(0)  # [13, T, H, W]
-                ch_attr = ch_attr.mean(dim=[1, 2, 3]).cpu().numpy()  # [13]
-                ch_attr = ch_attr / (ch_attr.sum() + 1e-8)
-                return ch_attr
-        except Exception:
-            pass
-
-        return np.ones(13) / 13.0
+        with torch.no_grad():
+            h_score = hard_score_from_obs(
+                bl_g[0][:, :, :2], weight_logits=self.model.hard_score_weight_logits)
+        with torch.enable_grad():
+            cond_g = self.model.encoder(bl_g, hard_score=h_score)       # [B, d_cond]
+            g = torch.autograd.grad(cond_g.pow(2).sum(), img_g)[0]       # [B,13,T,H,W]
+        ch_attr = g.abs().mean(0).mean(dim=[1, 2, 3]).detach().cpu().numpy()   # [13]
+        return ch_attr / (ch_attr.sum() + 1e-8)
 
     def compute(
         self,
@@ -265,7 +220,7 @@ class FMIntegrationAttribution:
         -------
         FMAttributionResult with channel attribution and physical interpretation.
         """
-        steps = ddim_steps or self.ddim_steps
+        steps = ddim_steps or self.ddim_steps or self.model.n_inference_steps
         self.ddim_steps = steps
 
         bl = [t.to(self.device) if torch.is_tensor(t) else t for t in batch_list]

@@ -34,7 +34,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .utils import crps_ensemble_fast, get_climatological_era5, get_climatological_traj
+from .utils import seed_crn, crps_ensemble_fast, get_climatological_era5, get_climatological_traj
 
 
 class TemporalAttributor:
@@ -95,6 +95,7 @@ class TemporalAttributor:
         all_traj : [K, T_pred, B, 2] ensemble trajectories (normalised)
         """
         with torch.no_grad():
+            seed_crn(0)
             _, _, all_traj = self.model.sample(
                 batch_list,
                 num_ensemble=K,

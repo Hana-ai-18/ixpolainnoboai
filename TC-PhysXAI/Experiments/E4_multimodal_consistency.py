@@ -60,7 +60,7 @@ def run_e4(
 
     temporal = TemporalAttributor(model, device, n_ensemble=K)
     spatial  = SpatialAttributor(model, device)
-    fm_attr  = FMIntegrationAttribution(model, device, ddim_steps=15)
+    fm_attr  = FMIntegrationAttribution(model, device)
     var_dec  = VarianceDecomposition(model, device, n_context_perturb=8)
     analogue = AnalogueXAI(model, device, n_clusters=3)
 
@@ -96,13 +96,13 @@ def run_e4(
                 spatial_entropy = 0.0
 
             # C4 FM-path attribution
-            c4_res = fm_attr.compute(bl_dev, ddim_steps=15)
+            c4_res = fm_attr.compute(bl_dev)
             c4_ch  = c4_res.channel_attribution  # [13]
             c4_upper = float(c4_ch[0] + c4_ch[1] + c4_ch[4] + c4_ch[5] + c4_ch[8] + c4_ch[9])
             c4_lower = float(c4_ch[2] + c4_ch[3] + c4_ch[6] + c4_ch[7] + c4_ch[10] + c4_ch[11])
 
             # C5 Variance decomposition
-            vd_res = var_dec.compute(bl_dev, K=K, ddim_steps=10)
+            vd_res = var_dec.compute(bl_dev, K=K)
             frac_context = vd_res.frac_context
             frac_noise   = vd_res.frac_noise
 
@@ -230,11 +230,8 @@ if __name__ == "__main__":
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
-    from Model.flow_matching_model import TCFlowMatching
-    ckpt  = torch.load(args.checkpoint, map_location=device)
-    model = TCFlowMatching(**ckpt.get("model_kwargs", {}))
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.to(device).eval()
+    from PhysXAI.model_io import load_tcxflow
+    model = load_tcxflow(args.checkpoint, device)
 
     from Model.data.trajectoriesWithMe_unet_training import TrajectoryDataset, seq_collate
     from torch.utils.data import DataLoader

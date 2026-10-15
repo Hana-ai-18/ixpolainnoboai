@@ -230,11 +230,8 @@ if __name__ == "__main__":
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
-    from Model.flow_matching_model import TCFlowMatching
-    ckpt  = torch.load(args.checkpoint, map_location=device)
-    model = TCFlowMatching(**ckpt.get("model_kwargs", {}))
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.to(device).eval()
+    from PhysXAI.model_io import load_tcxflow
+    model = load_tcxflow(args.checkpoint, device)
 
     from Model.data.trajectoriesWithMe_unet_training import TrajectoryDataset, seq_collate
     from torch.utils.data import DataLoader

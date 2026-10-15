@@ -193,3 +193,10 @@ TC-PhysXAI outputs are structured around four physical questions:
 3. **HOW CERTAIN?** (C5, M3): What fraction of ensemble spread is predictability-limited (noise) vs. scenario-dependent (context)? High V_context → different synoptic scenarios possible; high V_noise → chaotic trajectory around a single attractor.
 
 4. **WHAT IF?** (C6): What minimal synoptic change would alter the typhoon's track? Counterfactual shows the physically closest alternative reality.
+
+## E9 / E10 (comparison with XAI4Traj and physical-unit explanations)
+- `Experiments/E9_xai4traj_comparison.py` — XAI4Traj protocol (R/P/H tables) on many models, 5 segmentations
+  (`mdl rdp sliding` = baseline; `phys_abc`, `phys_regime` = TC-PhysXAI).
+- `Experiments/E10_joint_segments.py` — units = (motion-regime segment) x (TRACK | ERA5 level/variable group);
+  distribution-level effects, deletion faithfulness (neutral / noise / same-phase swap), Shapley, steering-flow check.
+  Read `results/E10/E10_notes.md` for the exact definitions and caveats. Use `--resume` on Kaggle.

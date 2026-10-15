@@ -120,18 +120,18 @@ def _cluster_trajectories_dtw(
 
 
 def _classify_trajectory_motion(
-    traj: np.ndarray,   # [T, 2] normalised (lat, lon)
+    traj: np.ndarray,   # [T, 2] ABSOLUTE normalised (lon_n, lat_n)
 ) -> Tuple[str, Tuple[float, float]]:
     """Classify track type from endpoint displacement.
 
     Uses denormalised lat/lon differences to identify motion regime.
-    Normalisation: lat ~ [0, 12.8], lon ~ [-21.4, 1.28] (from utils.py)
+    Degree thresholds below are heuristics (confirm with the advisor).
     """
-    # Denorm manually (consistent with utils.py)
-    _LAT_RANGE = (0.0, 12.8)
-    _LON_RANGE = (-21.4, 1.28)
-    lat = traj[:, 0] * (_LAT_RANGE[1] - _LAT_RANGE[0]) + _LAT_RANGE[0]
-    lon = traj[:, 1] * (_LON_RANGE[1] - _LON_RANGE[0]) + _LON_RANGE[0]
+    # (lon_n, lat_n), 1 unit = 5 deg  (see geo.py). Rules below use degrees.
+    from .geo import norm_to_lonlat
+    ll  = norm_to_lonlat(np.asarray(traj))
+    lat = ll[:, 1]
+    lon = ll[:, 0]
 
     # Total displacement from start to end
     d_lat = lat[-1] - lat[0]
@@ -355,23 +355,10 @@ class AnalogueXAI:
         cond : [B, d_cond]
         """
         bl = [t.to(self.device) if torch.is_tensor(t) else t for t in batch_list]
-        # Compute hard_score from observed trajectory (required by TC-XFlow encoder)
-        obs_traj = bl[0].to(self.device)  # [T_obs, B, 2] or similar
-        try:
-            from Model.flow_matching_model import hard_score_from_obs
-            h_score = hard_score_from_obs(
-                obs_traj[:, :, :2],
-                weight_logits=self.model.hard_score_weight_logits,
-            )
-            cond = self.model.encoder(bl, hard_score=h_score)   # [B, d_cond]
-        except (ImportError, AttributeError, Exception):
-            # Graceful fallback: try encoder without hard_score
-            try:
-                cond = self.model.encoder(bl)
-            except Exception:
-                # Last resort: return zero context of plausible size
-                B = obs_traj.shape[1] if obs_traj.dim() >= 2 else 1
-                cond = torch.zeros(B, 256, device=self.device)
+        from Model.flow_matching_model import hard_score_from_obs
+        h_score = hard_score_from_obs(
+            bl[0][:, :, :2], weight_logits=self.model.hard_score_weight_logits)
+        cond = self.model.encoder(bl, hard_score=h_score)   # [B, d_cond]
         return cond
 
     def build_analogue_library(

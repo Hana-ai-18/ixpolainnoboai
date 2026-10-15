@@ -47,22 +47,27 @@ LEVEL_GROUPS = {
 
 # Normalisation scales for trajectory coordinates
 _MOVE_VEL_NORM = 150.0
-_LON_NORM_RANGE = (-21.4, 1.28)
-_LAT_NORM_RANGE = (0.0,  12.8)
+
+
+def seed_crn(seed: int = 0) -> None:
+    """Common random numbers: call right before every ensemble `model.sample`
+    whose result is COMPARED with another run (masked vs unmasked, perturbed vs
+    clean). Without it, the ratio/difference of two CRPS values also contains
+    sampling noise, which can be as large as the effect being measured."""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def denorm_latlon(traj_norm: torch.Tensor) -> torch.Tensor:
-    """Convert normalised [0,1] lat/lon back to degrees.
+    """Absolute normalised (lon_n, lat_n) -> (lat_deg, lon_deg).
 
-    Args:
-        traj_norm: [..., 2] tensor with (lat_norm, lon_norm)
-    Returns:
-        [..., 2] tensor with (lat_deg, lon_deg)
+    Dataset convention (Model/flow_matching_model.py::_norm_to_deg, see geo.py):
+    index 0 = longitude, index 1 = latitude, lon = 5*x0 + 180, lat = 5*x1.
+    NOTE the OUTPUT order is (lat, lon) because haversine_km expects it.
     """
-    lat_n = traj_norm[..., 0]
-    lon_n = traj_norm[..., 1]
-    lat_deg = lat_n * (_LAT_NORM_RANGE[1] - _LAT_NORM_RANGE[0]) + _LAT_NORM_RANGE[0]
-    lon_deg = lon_n * (_LON_NORM_RANGE[1] - _LON_NORM_RANGE[0]) + _LON_NORM_RANGE[0]
+    lon_deg = traj_norm[..., 0] * 5.0 + 180.0
+    lat_deg = traj_norm[..., 1] * 5.0
     return torch.stack([lat_deg, lon_deg], dim=-1)
 
 

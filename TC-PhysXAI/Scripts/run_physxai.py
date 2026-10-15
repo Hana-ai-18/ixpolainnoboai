@@ -89,8 +89,8 @@ def parse_args():
                         help="Save per-storm meteorological bulletins to text files")
     parser.add_argument("--run_experiments",action="store_true",
                         help="Also run E1-E6 experiments after main analysis")
-    parser.add_argument("--ddim_steps",    type=int, default=20,
-                        help="ODE integration steps for C4/C6")
+    parser.add_argument("--ddim_steps",    type=int, default=None,
+                        help="Euler steps for C4/C5/C6 (default: model.n_inference_steps, as in sample())")
     return parser.parse_args()
 
 
@@ -113,22 +113,11 @@ def setup_output_dirs(output_dir: str) -> Dict[str, str]:
 def load_model(checkpoint_path: str, device: torch.device):
     """Load TC-XFlow model from checkpoint."""
     print(f"[PhysXAI] Loading model from {checkpoint_path}")
-    ckpt = torch.load(checkpoint_path, map_location=device)
-
-    from Model.flow_matching_model import TCFlowMatching
-    model_kwargs = ckpt.get("model_kwargs", {
-        "obs_len": 8, "pred_len": 12,
-        "d_cond": 256, "d_model": 256,
-        "nhead": 8, "num_dec_layers": 4, "unet_in_ch": 13,
-    })
-    model = TCFlowMatching(**model_kwargs)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.to(device).eval()
+    from PhysXAI.model_io import load_tcxflow
+    model = load_tcxflow(checkpoint_path, device)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[PhysXAI] Model loaded. Parameters: {n_params:,}")
-    print(f"[PhysXAI] Epoch: {ckpt.get('epoch', 'N/A')}, "
-          f"Best CRPS: {ckpt.get('best_crps', 'N/A'):.4f}" if 'best_crps' in ckpt else "")
     return model
 
 
@@ -261,7 +250,7 @@ def analyse_storm(
     # ─── C5: Variance decomposition ──────────────────────────────────────────
     if "c5" in modules_to_run and c5_mod is not None:
         try:
-            c5_result = c5_mod.compute(bl, K=max(K//3, 5), ddim_steps=ddim_steps//2)
+            c5_result = c5_mod.compute(bl, K=max(K//3, 5), ddim_steps=ddim_steps)
             result_store["c5"] = {
                 "frac_noise":         c5_result.frac_noise,
                 "frac_context":       c5_result.frac_context,

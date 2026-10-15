@@ -46,22 +46,8 @@ def load_model_and_data(args, device):
     """Load TC-XFlow model and test dataset."""
     print(f"[Master] Loading model from {args.checkpoint} ...")
 
-    from Model.flow_matching_model import TCFlowMatching
-    ckpt = torch.load(args.checkpoint, map_location=device)
-
-    # Try to reconstruct model kwargs
-    model_kwargs = ckpt.get("model_kwargs", {})
-    if not model_kwargs:
-        # Defaults from train_flowmatching.py
-        model_kwargs = {
-            "obs_len": 8, "pred_len": 12,
-            "d_cond": 256, "d_model": 256, "nhead": 8,
-            "num_dec_layers": 4, "unet_in_ch": 13,
-        }
-
-    model = TCFlowMatching(**model_kwargs)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.to(device).eval()
+    from PhysXAI.model_io import load_tcxflow
+    model = load_tcxflow(args.checkpoint, device)
     print(f"[Master] Model loaded. Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     from Model.data.trajectoriesWithMe_unet_training import TrajectoryDataset, seq_collate

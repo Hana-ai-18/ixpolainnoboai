@@ -29,7 +29,7 @@ TC-PhysXAI extends XAI4Traj in four dimensions:
   │ Task                │ Classification (label)   │ Ensemble probabilistic (CRPS)  │
   │ Segmentation        │ Data-driven spatial      │ Physics-driven temporal A/B/C  │
   │                     │ (RDP / MDL / sliding)    │ + Adaptive boundary search     │
-  │ Perturbation        │ Gaussian/Scaling/Rotation│ Climatological baseline (zero) │
+  │ Perturbation        │ Gaussian/Scaling/Rotation│ Neutral mask (interp. / mean)  │
   │ Attribution signal  │ Surrogate coefficient θ  │ ΔCRPS direct (no surrogate)    │
   │ Fidelity metric     │ H-mean(P, R)             │ H-mean-F(P-F, R-F, U-F)        │
   │ Scope               │ Local (per-instance)     │ Local + Global (cross-TC)      │
@@ -96,6 +96,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+from .utils import seed_crn
 from dataclasses import dataclass, field
 
 
@@ -339,17 +340,48 @@ def _crps_ensemble(
     return float((term1 - 0.5 * diffs).mean().item())
 
 
+def _neutral_fill(t: torch.Tensor, steps: List[int]) -> torch.Tensor:
+    """Replace time rows `steps` of a [T, B, C] tensor by linear interpolation
+    between the nearest UNMASKED rows (ends are held constant).
+
+    A neutral baseline for trajectory coordinates: zeroing normalised
+    coordinates would put the storm at (180°E, 0°N) and measure that artificial
+    jump instead of the importance of the segment.
+    """
+    T = t.shape[0]
+    masked = sorted({s for s in steps if 0 <= s < T})
+    keep = [i for i in range(T) if i not in set(masked)]
+    out = t.clone()
+    if not keep:
+        return out
+    for s in masked:
+        left = [k for k in keep if k < s]
+        right = [k for k in keep if k > s]
+        if left and right:
+            l, r = left[-1], right[0]
+            w = (s - l) / (r - l)
+            out[s] = t[l] * (1.0 - w) + t[r] * w
+        elif left:
+            out[s] = t[left[-1]]
+        else:
+            out[s] = t[right[0]]
+    return out
+
+
 def _mask_obs_steps(
     batch_list:    list,
     steps_to_mask: List[int],
     device:        torch.device,
 ) -> list:
-    """Replace selected observation time steps with climatological baseline (zeros).
+    """Neutral-mask selected observation time steps.
 
     Slots modified:
-      batch_list[0]  = obs_traj  [T_obs, B, 2]     → zero selected rows
-      batch_list[7]  = obs_Me    [T_obs, B, 4]     → zero selected rows
-      batch_list[11] = img_obs   [B, 13, T_obs, H, W] → zero selected slices
+      batch_list[0]  = obs_traj  [T_obs, B, 2]     → linear interpolation of the
+                                                     unmasked steps (NOT zeros)
+      batch_list[2]  = obs_rel   [T_obs, B, 2]     → recomputed from the new obs_traj
+      batch_list[7]  = obs_Me    [T_obs, B, C]     → linear interpolation
+      batch_list[11] = img_obs   [B, 13, T_obs, H, W] → zero = climatological mean
+                                                     (ERA5 is normalised, 0 = mean)
     """
     out = []
     for i, item in enumerate(batch_list):
@@ -359,19 +391,8 @@ def _mask_obs_steps(
 
         t = item.to(device)
 
-        if i == 0:                  # obs_traj  [T_obs, B, 2]
-            t_mod = t.clone()
-            for s in steps_to_mask:
-                if s < t_mod.shape[0]:
-                    t_mod[s] = 0.0
-            out.append(t_mod)
-
-        elif i == 7:                # obs_Me  [T_obs, B, 4]
-            t_mod = t.clone()
-            for s in steps_to_mask:
-                if s < t_mod.shape[0]:
-                    t_mod[s] = 0.0
-            out.append(t_mod)
+        if i in (0, 7):             # obs_traj / obs_Me  [T_obs, B, C]
+            out.append(_neutral_fill(t, steps_to_mask))
 
         elif i == 11:               # img_obs  [B, 13, T_obs, H, W]
             t_mod = t.clone()
@@ -382,6 +403,14 @@ def _mask_obs_steps(
 
         else:
             out.append(t)
+
+    # keep obs_rel consistent with the (interpolated) obs_traj, as in the dataset:
+    # rel[0] = 0, rel[t] = obs[t] - obs[t-1]
+    if (len(out) > 2 and torch.is_tensor(out[0]) and torch.is_tensor(out[2])
+            and out[2].shape == out[0].shape):
+        rel = torch.zeros_like(out[0])
+        rel[1:] = out[0][1:] - out[0][:-1]
+        out[2] = rel
 
     return out
 
@@ -420,7 +449,7 @@ class SegmentPerturbationXAI:
     Key differences from XAI4Traj:
       • Segments defined by physical meteorological phases (not data-driven RDP)
       • Attribution signal is ΔCRPS from ensemble sampling (not surrogate θ)
-      • Perturbation baseline is climatological mean (not Gaussian/scaling)
+      • Perturbation = neutral masking: coordinates interpolated, ERA5 set to its mean
       • Fidelity uses H-mean-F with Uncertainty-F (not plain H-mean)
 
     Usage
@@ -451,6 +480,7 @@ class SegmentPerturbationXAI:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (ensemble_traj [K,T,B,2], pred_gt [T,B,2])."""
         bl = [t.to(self.device) if torch.is_tensor(t) else t for t in batch_list]
+        seed_crn(0)
         _, _, all_traj = self.model.sample(
             bl,
             num_ensemble=self.K,

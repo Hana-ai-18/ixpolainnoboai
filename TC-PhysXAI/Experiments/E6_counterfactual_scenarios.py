@@ -53,7 +53,7 @@ def run_e6(
     output_dir: str = "results",
     n_storms: int = 20,
     cf_types: List[str] = None,
-    ddim_steps: int = 20,
+    ddim_steps: Optional[int] = None,
     max_iter: int = 100,
 ) -> pd.DataFrame:
     """Run E6: Counterfactual scenario analysis."""
@@ -67,7 +67,7 @@ def run_e6(
         ddim_steps=ddim_steps,
         lr=0.01,
         max_iter=max_iter,
-        cf_epsilon=0.25,
+        cf_epsilon=0.1,   # degrees (RMS position error to the target)
         reg_lambda=0.05,
     )
     interp = MeteorologyInterpreter()
@@ -174,10 +174,9 @@ def _plot_e6(df: pd.DataFrame, track_data: List[Dict], output_dir: str) -> None:
             color   = cf_colors.get(cf_type, "grey")
 
             # Denorm to degrees
-            orig_lat = orig[:, 0] * 12.8
-            orig_lon = orig[:, 1] * 22.68 + 130  # rough Pacific offset
-            cf_lat   = cf[:, 0] * 12.8
-            cf_lon   = cf[:, 1] * 22.68 + 130
+            # absolute normalised (lon_n, lat_n): lon = 5*x0 + 180, lat = 5*x1
+            orig_lon, orig_lat = orig[:, 0] * 5.0 + 180.0, orig[:, 1] * 5.0
+            cf_lon,   cf_lat   = cf[:, 0] * 5.0 + 180.0,   cf[:, 1] * 5.0
 
             if plotted == 0:
                 ax.plot(orig_lon, orig_lat, "k-", linewidth=2, label="Original", zorder=5)
@@ -243,11 +242,8 @@ if __name__ == "__main__":
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
-    from Model.flow_matching_model import TCFlowMatching
-    ckpt  = torch.load(args.checkpoint, map_location=device)
-    model = TCFlowMatching(**ckpt.get("model_kwargs", {}))
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.to(device).eval()
+    from PhysXAI.model_io import load_tcxflow
+    model = load_tcxflow(args.checkpoint, device)
 
     from Model.data.trajectoriesWithMe_unet_training import TrajectoryDataset, seq_collate
     from torch.utils.data import DataLoader

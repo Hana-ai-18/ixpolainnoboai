@@ -46,29 +46,13 @@ from PhysXAI.utils import denorm_latlon
 
 
 def classify_recurvature(pred_traj: torch.Tensor, threshold_dlat: float = 3.0) -> bool:
-    """Classify whether a storm recurves within the prediction window.
+    """Does the (ground-truth) track of storm 0 recurve within the window?
 
-    Args:
-        pred_traj: [T_pred, B, 2] normalised (lat, lon)
-        threshold_dlat: minimum northward displacement (normalised) to classify as recurvature
-
-    Returns:
-        True if storm recurves
+    pred_traj: [T_pred, B, 2] ABSOLUTE normalised (lon_n, lat_n); 1 unit = 5 degrees.
+    threshold_dlat is in DEGREES of poleward motion over the 2nd half of the window.
     """
-    # Denorm
-    lat = pred_traj[:, 0, 0].cpu().numpy() * 12.8  # degrees
-    lon = pred_traj[:, 0, 1].cpu().numpy() * 22.68
-
-    if len(lat) < 4:
-        return False
-
-    mid  = len(lat) // 2
-    d_lat_early = lat[mid] - lat[0]
-    d_lat_late  = lat[-1] - lat[mid]
-    d_lon_late  = lon[-1] - lon[mid]
-
-    # Recurvature: significant northward turn + eastward component in second half
-    return bool(d_lat_late > threshold_dlat and d_lon_late > -2.0)
+    from PhysXAI.geo import classify_recurvature as _cr
+    return _cr(pred_traj[:, 0, :].detach().cpu().numpy(), threshold_dlat)
 
 
 def run_e2(
@@ -247,11 +231,8 @@ if __name__ == "__main__":
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
-    from Model.flow_matching_model import TCFlowMatching
-    ckpt  = torch.load(args.checkpoint, map_location=device)
-    model = TCFlowMatching(**ckpt.get("model_kwargs", {}))
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.to(device).eval()
+    from PhysXAI.model_io import load_tcxflow
+    model = load_tcxflow(args.checkpoint, device)
 
     from Model.data.trajectoriesWithMe_unet_training import TrajectoryDataset, seq_collate
     from torch.utils.data import DataLoader

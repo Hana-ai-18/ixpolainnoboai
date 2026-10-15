@@ -39,14 +39,17 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
+from .geo import norm_to_lonlat
+from .fm_sampling import sample_z0, fm_integrate
+
 
 @dataclass
 class CounterfactualResult:
     """Result of C6 FM counterfactual generation."""
     # Original and counterfactual tracks
-    original_track:       np.ndarray       # [T_pred, 2] normalised
-    counterfactual_track: np.ndarray       # [T_pred, 2] normalised
-    target_track:         np.ndarray       # [T_pred, 2] specified by user/auto
+    original_track:       np.ndarray       # [T_pred, 2] ABSOLUTE normalised (lon_n, lat_n); 1 unit = 5 deg
+    counterfactual_track: np.ndarray       # [T_pred, 2] ABSOLUTE normalised (lon_n, lat_n)
+    target_track:         np.ndarray       # [T_pred, 2] ABSOLUTE normalised (lon_n, lat_n)
 
     # Context perturbation
     delta_context:        np.ndarray       # [d_cond] — Δc
@@ -95,21 +98,21 @@ def _haversine_km_np(lat1, lon1, lat2, lon2):
 
 
 def _make_recurvature_target(
-    original_traj: np.ndarray,   # [T, 2] normalised
-    deflect_north: float = 0.05, # in normalised units (~0.64° lat)
-    deflect_east:  float = 0.03, # in normalised units
-    onset_step:    int   = 4,     # steps after which recurvature begins
+    original_traj: np.ndarray,   # [T, 2] ABSOLUTE normalised (lon_n, lat_n)
+    deflect_north: float = 0.18, # normalised units of LATITUDE  (1 unit = 5 deg -> 0.9 deg)
+    deflect_east:  float = 0.18, # normalised units of LONGITUDE (1 unit = 5 deg -> 0.9 deg)
+    onset_step:    int   = 4,    # steps after which the deflection starts
 ) -> np.ndarray:
-    """Generate a recurvature counterfactual target from original track.
+    """Counterfactual target: linearly growing north/east deflection after onset_step.
 
-    Linearly increases northward/eastward deflection after onset_step.
+    Coordinate convention (see geo.py): index 0 = longitude, index 1 = latitude.
     """
     T   = original_traj.shape[0]
     cf  = original_traj.copy()
     for t in range(onset_step, T):
         frac = (t - onset_step) / max(T - onset_step - 1, 1)
-        cf[t, 0] += deflect_north * frac  # lat increases (northward)
-        cf[t, 1] += deflect_east  * frac  # lon increases (eastward = recurvature)
+        cf[t, 1] += deflect_north * frac   # latitude  (poleward)
+        cf[t, 0] += deflect_east  * frac   # longitude (eastward)
     return cf
 
 
@@ -127,10 +130,10 @@ class FMCounterfactual:
         self,
         model,
         device: torch.device,
-        ddim_steps: int = 20,
+        ddim_steps: Optional[int] = None,   # None -> model.n_inference_steps (same as sample())
         lr: float = 0.01,
         max_iter: int = 100,
-        cf_epsilon: float = 0.3,     # target track matching tolerance
+        cf_epsilon: float = 0.1,     # stop when RMS position error to the target < cf_epsilon DEGREES
         reg_lambda: float = 0.1,     # L2 regularisation on Δc
     ):
         self.model      = model
@@ -142,81 +145,32 @@ class FMCounterfactual:
         self.reg_lambda = reg_lambda
         self.model.eval()
 
+    def _encode(self, bl: list) -> torch.Tensor:
+        from Model.flow_matching_model import hard_score_from_obs
+        h_score = hard_score_from_obs(
+            bl[0][:, :, :2], weight_logits=self.model.hard_score_weight_logits)
+        return self.model.encoder(bl, hard_score=h_score)
+
     @torch.no_grad()
     def _get_context_and_traj(
         self,
         batch_list: list,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Extract baseline context, z0, and run forward ODE.
+        """Baseline context, fixed z0 (same law as sample(): N(0, sigma_inference^2))
+        and the raw ODE track (no candidate scoring / speed calibration).
 
-        Uses model.encoder() with hard_score (correct TC-XFlow API) and
-        model.velocity() for the ODE integration step.
-
-        Returns
-        -------
-        cond      : [B, d_cond]
-        z0        : [B, T_pred, 2]
-        base_traj : [T_pred, B, 2]
-        """
+        Returns cond [B,d_cond], z0 [B,T_pred,2], base_traj [T_pred,B,2] (absolute)."""
         bl = [t.to(self.device) if torch.is_tensor(t) else t for t in batch_list]
-        obs_traj = bl[0]
-
-        try:
-            from Model.flow_matching_model import hard_score_from_obs
-            h_score = hard_score_from_obs(
-                obs_traj[:, :, :2],
-                weight_logits=self.model.hard_score_weight_logits,
-            )
-            cond = self.model.encoder(bl, hard_score=h_score)
-        except (ImportError, AttributeError, Exception):
-            try:
-                cond = self.model.encoder(bl)
-            except Exception:
-                B_fallback = obs_traj.shape[1] if obs_traj.dim() >= 2 else 1
-                cond = torch.zeros(B_fallback, 256, device=self.device)
-
-        B      = cond.shape[0]
-        T_pred = batch_list[1].shape[0] if torch.is_tensor(batch_list[1]) else 12
-        z0     = torch.randn(B, T_pred, 2, device=self.device)
-
-        # ODE forward with correct velocity API
-        z   = z0.clone()
-        dt  = 1.0 / self.ddim_steps
-        for i in range(self.ddim_steps):
-            t_vec = torch.full((B,), i * dt, device=self.device)
-            try:
-                # Correct API: model.velocity(z, t, cond)
-                v = self.model.velocity(z, t_vec, cond)
-            except Exception:
-                v = torch.zeros_like(z)
-            z = z + dt * v
-
-        traj = z.permute(1, 0, 2)  # [T_pred, B, 2]
+        self._last_obs = bl[0][-1]
+        cond = self._encode(bl)
+        gen = torch.Generator(device=self.device).manual_seed(0)
+        z0 = sample_z0(self.model, cond.shape[0], bl[1].shape[0], self.device, gen)
+        traj = self._ode_forward(z0, cond)
         return cond, z0, traj
 
-    def _ode_forward(
-        self,
-        z0: torch.Tensor,     # [B, T_pred, 2]
-        cond: torch.Tensor,   # [B, d_cond]
-    ) -> torch.Tensor:
-        """Run ODE from z0 with given cond. Returns [T_pred, B, 2].
-
-        Uses model.velocity() — the correct TC-XFlow attribute name.
-        """
-        z  = z0.clone()
-        dt = 1.0 / self.ddim_steps
-        B  = z0.shape[0]
-
-        for i in range(self.ddim_steps):
-            t_vec = torch.full((B,), i * dt, device=self.device)
-            try:
-                # Correct API: model.velocity(z, t, cond)
-                v = self.model.velocity(z, t_vec, cond)
-            except Exception:
-                v = torch.zeros_like(z)
-            z = z + dt * v
-
-        return z.permute(1, 0, 2)   # [T_pred, B, 2]
+    def _ode_forward(self, z0: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        """Integrate exactly like TCFlowMatching.sample. Returns ABSOLUTE [T_pred, B, 2]."""
+        return fm_integrate(self.model, z0, cond, self._last_obs, self.ddim_steps)
 
     def _project_delta_to_channels(
         self,
@@ -232,39 +186,18 @@ class FMCounterfactual:
         """
         img_obs = batch_list[11] if len(batch_list) > 11 else None
         if img_obs is None or not torch.is_tensor(img_obs):
-            return np.ones(13) / 13.0
+            raise ValueError("C6: batch has no ERA5 tensor at index 11")
 
-        img   = img_obs.to(self.device).float()
-        img_g = img.detach().requires_grad_(True)
-
-        bl_g = list(batch_list)
+        bl_g = [t.to(self.device) if torch.is_tensor(t) else t for t in batch_list]
+        img_g = bl_g[11].float().detach().requires_grad_(True)
         bl_g[11] = img_g
-
-        try:
-            # Use model.encoder with hard_score — consistent with module2_spatial
-            from Model.flow_matching_model import hard_score_from_obs
-            obs_traj = batch_list[0].to(self.device)
-            with torch.no_grad():
-                h_score = hard_score_from_obs(
-                    obs_traj[:, :, :2],
-                    weight_logits=self.model.hard_score_weight_logits,
-                )
-            with torch.enable_grad():
-                cond_g = self.model.encoder(bl_g, hard_score=h_score)  # [B, d_cond]
-
-            # Project delta_c onto the Jacobian columns
-            delta_c_dev = delta_c.to(self.device)
-            # v^T J = J^T v (vector-Jacobian product)
-            (cond_g * delta_c_dev.unsqueeze(0)).sum().backward()
-
-            if img_g.grad is not None:
-                ch_proj = img_g.grad.detach().abs().mean(0).mean(dim=[1, 2, 3]).cpu().numpy()
-                ch_proj = ch_proj / (ch_proj.sum() + 1e-8)
-                return ch_proj
-        except Exception:
-            pass
-
-        return np.ones(13) / 13.0
+        with torch.enable_grad():
+            cond_g = self._encode(bl_g)                       # [B, d_cond]
+            # vector-Jacobian product  J^T delta_c
+            g = torch.autograd.grad((cond_g * delta_c.to(self.device).unsqueeze(0)).sum(),
+                                    img_g)[0]
+        ch_proj = g.abs().mean(0).mean(dim=[1, 2, 3]).detach().cpu().numpy()   # [13]
+        return ch_proj / (ch_proj.sum() + 1e-8)
 
     def compute(
         self,
@@ -300,11 +233,11 @@ class FMCounterfactual:
             cf_target_np = target_traj
         elif cf_type == "RECURVATURE":
             cf_target_np = _make_recurvature_target(
-                base_np, deflect_north=0.07, deflect_east=0.04, onset_step=T_pred//3
+                base_np, deflect_north=0.18, deflect_east=0.18, onset_step=T_pred//3
             )
         elif cf_type == "STRAIGHT":
             cf_target_np = _make_recurvature_target(
-                base_np, deflect_north=-0.03, deflect_east=-0.05, onset_step=T_pred//3
+                base_np, deflect_north=-0.076, deflect_east=-0.227, onset_step=T_pred//3
             )
         else:
             cf_target_np = base_np.copy()
@@ -323,31 +256,34 @@ class FMCounterfactual:
         if verbose:
             print(f"[C6] Running CF optimisation ({self.max_iter} iterations) ...")
 
+        eps_norm = self.cf_epsilon / 5.0          # degrees -> normalised units
         for step in range(self.max_iter):
             optimiser.zero_grad()
+            cand = delta_c.detach().clone()       # the delta that is evaluated below
             cond_cf = cond.detach() + delta_c
 
             traj_cf = self._ode_forward(z0.detach(), cond_cf)  # [T_pred, B, 2]
 
-            track_loss = (traj_cf - cf_target_batch).pow(2).mean()
+            track_mse  = (traj_cf - cf_target_batch).pow(2).sum(-1).mean()   # norm units^2
+            track_loss = track_mse
             reg_loss   = self.reg_lambda * delta_c.pow(2).mean()
             loss       = track_loss + reg_loss
 
-            loss.backward()
-            optimiser.step()
-
-            if verbose and (step + 1) % 20 == 0:
-                print(f"  Step {step+1}: loss={loss.item():.4f}, "
-                      f"track={track_loss.item():.4f}, reg={reg_loss.item():.4f}")
-
             if loss.item() < best_loss:
                 best_loss  = loss.item()
-                best_delta = delta_c.detach().clone()
+                best_delta = cand
 
-            if track_loss.item() < self.cf_epsilon ** 2:
+            if verbose and (step + 1) % 20 == 0:
+                print(f"  Step {step+1}: loss={loss.item():.5f}, "
+                      f"track={track_loss.item():.5f}, reg={reg_loss.item():.5f}")
+
+            if track_mse.item() < eps_norm ** 2:
                 if verbose:
                     print(f"  Converged at step {step+1}.")
                 break
+
+            loss.backward()
+            optimiser.step()
 
         # Final counterfactual trajectory
         with torch.no_grad():
@@ -364,10 +300,10 @@ class FMCounterfactual:
         ch_delta = self._project_delta_to_channels(delta_c_np, bl)  # [13]
         ch_delta_phys = ch_delta * _CH_STD  # scale to physical units
 
-        # Max track displacement (approx in degrees → km)
-        lat_diff = (cf_np[:, 0] - base_np[:, 0]) * 12.8   # normalised → degrees
-        lon_diff = (cf_np[:, 1] - base_np[:, 1]) * 22.68
-        dist_km  = np.sqrt((lat_diff * 111.0)**2 + (lon_diff * 111.0)**2).max()
+        # Max great-circle displacement between original and counterfactual track (km)
+        ll_o = norm_to_lonlat(base_np)
+        ll_c = norm_to_lonlat(cf_np)
+        dist_km = float(_haversine_km_np(ll_o[:, 1], ll_o[:, 0], ll_c[:, 1], ll_c[:, 0]).max())
 
         phys = self._interpret(cf_type, ch_delta, ch_delta_phys, c_norm_frac, dist_km)
 

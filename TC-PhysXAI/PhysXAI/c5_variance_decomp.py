@@ -46,6 +46,7 @@ import numpy as np
 import torch
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
+from .fm_sampling import sample_z0, fm_integrate
 
 
 @dataclass
@@ -91,84 +92,31 @@ class VarianceDecomposition:
     @torch.no_grad()
     def _sample_fixed_z0(
         self,
-        batch_list: list,
-        z0: torch.Tensor,       # [B, T_pred, 2]
+        z0: torch.Tensor,        # [B, T_pred, 2]  (already ~ N(0, sigma_inference^2))
         cond: torch.Tensor,      # [B, d_cond]
-        ddim_steps: int = 20,
+        last_obs: torch.Tensor,  # [B, 2]
+        ddim_steps: Optional[int] = None,
     ) -> torch.Tensor:
-        """Run ODE from a FIXED z0 with given context.
-
-        Uses model.velocity() — correct attribute name in TC-XFlow.
-
-        Returns
-        -------
-        traj : [T_pred, B, 2]
-        """
-        B, T_pred, _ = z0.shape
-        z = z0.clone()
-        dt = 1.0 / ddim_steps
-
-        for i in range(ddim_steps):
-            t_scalar = torch.full((B,), i * dt, device=self.device)
-            try:
-                # Correct API: model.velocity(z, t, cond)
-                v = self.model.velocity(z, t_scalar, cond)
-            except Exception:
-                v = torch.zeros_like(z)
-            z = z + dt * v
-
-        return z.permute(1, 0, 2)  # [T_pred, B, 2]
+        """ODE from a FIXED z0 with the given context, integrated exactly like
+        TCFlowMatching.sample (see fm_sampling.fm_integrate). Returns ABSOLUTE
+        normalised tracks [T_pred, B, 2]."""
+        return fm_integrate(self.model, z0, cond, last_obs, ddim_steps)
 
     @torch.no_grad()
     def _get_context(self, batch_list: list) -> torch.Tensor:
-        """Extract context vector from ContextEncoder (model.encoder).
-
-        Uses the hard_score pattern required by TC-XFlow, consistent with
-        module2_spatial (C2).
-
-        Returns [B, d_cond]
-        """
+        """Context vector from model.encoder (with hard_score). Raises on failure."""
+        from Model.flow_matching_model import hard_score_from_obs
         bl = [t.to(self.device) if torch.is_tensor(t) else t for t in batch_list]
-        obs_traj = bl[0]
-        try:
-            from Model.flow_matching_model import hard_score_from_obs
-            h_score = hard_score_from_obs(
-                obs_traj[:, :, :2],
-                weight_logits=self.model.hard_score_weight_logits,
-            )
-            return self.model.encoder(bl, hard_score=h_score)
-        except (ImportError, AttributeError, Exception):
-            try:
-                return self.model.encoder(bl)
-            except Exception:
-                B = obs_traj.shape[1] if obs_traj.dim() >= 2 else 1
-                return torch.zeros(B, 256, device=self.device)
-
-    @torch.no_grad()
-    def _standard_ensemble(
-        self,
-        batch_list: list,
-        K: int,
-    ) -> torch.Tensor:
-        """Standard ensemble (vary z0, fixed context inference).
-
-        Returns
-        -------
-        all_traj : [K, T_pred, B, 2]
-        """
-        _, _, all_traj = self.model.sample(
-            batch_list,
-            num_ensemble=K,
-            use_speed_calibration=True,
-            return_xai=False,
-        )
-        return all_traj   # [K, T_pred, B, 2]
+        h_score = hard_score_from_obs(
+            bl[0][:, :, :2], weight_logits=self.model.hard_score_weight_logits)
+        return self.model.encoder(bl, hard_score=h_score)
 
     def compute(
         self,
         batch_list: list,
         K: int = 30,
-        ddim_steps: int = 20,
+        ddim_steps: Optional[int] = None,
+        n_z0_for_context: int = 3,
         predictability_threshold: float = 0.5,
         storm_idx: int = 0,
         verbose: bool = False,
@@ -178,7 +126,8 @@ class VarianceDecomposition:
         Parameters
         ----------
         K                        : number of ensemble members for V_noise
-        ddim_steps               : ODE integration steps
+        ddim_steps               : Euler steps; None -> model.n_inference_steps (as in sample())
+        n_z0_for_context         : V_context is averaged over this many FIXED z0 draws
         predictability_threshold : V_total normalised threshold for horizon
         storm_idx                : which storm in batch to analyse
 
@@ -199,42 +148,45 @@ class VarianceDecomposition:
         else:
             T_pred = 12
 
-        # ─── Step 1: Standard ensemble for V_noise ────────────────────────
+        # Both terms use the SAME raw generator (fm_integrate: z0 ~ N(0, sigma_inf^2),
+        # model.n_inference_steps Euler steps) — i.e. the candidates of sample() before
+        # scoring / top-3 weighting / speed calibration. Output: absolute normalised tracks.
+        last_obs  = bl[0][-1]
+        base_cond = self._get_context(bl)               # [B, d_cond]
+        gen = torch.Generator(device=self.device).manual_seed(0)
 
+        # ─── Step 1: V_noise = Var over z0 at FIXED context ────────────────
         if verbose:
-            print(f"[C5] Generating K={K} ensemble trajectories for V_noise ...")
-
-        all_traj = self._standard_ensemble(bl, K)   # [K, T_pred, B, 2]
-        # Extract single storm
-        traj_k = all_traj[:, :, storm_idx, :]       # [K, T_pred, 2]
-
-        # Var_{z0}[f | c] computed over K members per horizon
+            print(f"[C5] K={K} z0 draws at fixed context for V_noise ...")
+        with torch.no_grad():
+            traj_k = torch.stack([
+                self._sample_fixed_z0(sample_z0(self.model, B, T_pred, self.device, gen),
+                                      base_cond, last_obs, ddim_steps)[:, storm_idx, :]
+                for _ in range(K)
+            ], dim=0)                                   # [K, T_pred, 2]
         var_noise_per_horizon = traj_k.var(dim=0).mean(dim=-1)  # [T_pred]
         v_noise = float(var_noise_per_horizon.mean())
 
-        # ─── Step 2: Context perturbation for V_context ───────────────────
-
+        # ─── Step 2: V_context = Var over context perturbations at FIXED z0 ──
         if verbose:
-            print(f"[C5] Perturbing context (n={self.n_context_perturb}) for V_context ...")
-
-        base_cond  = self._get_context(bl)              # [B, d_cond]
-        sigma_cond = base_cond.std()
-        eps        = self.context_noise_level * sigma_cond
-
-        perturbed_trajs = []
-        for _ in range(self.n_context_perturb):
-            # Perturb context
-            noise = torch.randn_like(base_cond) * eps
-            cond_p = base_cond + noise
-
-            # Fix z0 to the SAME seed for all context perturbations
-            z0_fixed = torch.randn(B, T_pred, 2, device=self.device)
-            traj_p = self._sample_fixed_z0(bl, z0_fixed, cond_p, ddim_steps)
-            # traj_p : [T_pred, B, 2]
-            perturbed_trajs.append(traj_p[:, storm_idx, :])  # [T_pred, 2]
-
-        perturbed_trajs = torch.stack(perturbed_trajs, dim=0)  # [n_perturb, T_pred, 2]
-        var_context_per_horizon = perturbed_trajs.var(dim=0).mean(dim=-1)  # [T_pred]
+            print(f"[C5] {self.n_context_perturb} context perturbations x "
+                  f"{n_z0_for_context} fixed z0 for V_context ...")
+        eps = self.context_noise_level * base_cond.std()
+        z0_list = [sample_z0(self.model, B, T_pred, self.device, gen)
+                   for _ in range(n_z0_for_context)]    # drawn ONCE, reused for every perturbation
+        # one set of context perturbations shared by all z0 (paired design)
+        noises = [torch.randn(base_cond.shape, device=self.device, generator=gen) * eps
+                  for _ in range(self.n_context_perturb)]
+        var_ctx_list = []
+        with torch.no_grad():
+            for z0_fixed in z0_list:
+                trajs = torch.stack([
+                    self._sample_fixed_z0(z0_fixed, base_cond + nz, last_obs, ddim_steps
+                                          )[:, storm_idx, :]
+                    for nz in noises
+                ], dim=0)                               # [n_perturb, T_pred, 2]
+                var_ctx_list.append(trajs.var(dim=0).mean(dim=-1))      # [T_pred]
+        var_context_per_horizon = torch.stack(var_ctx_list, 0).mean(0)  # [T_pred]
         v_context = float(var_context_per_horizon.mean())
 
         # ─── Step 3: Decomposition ────────────────────────────────────────

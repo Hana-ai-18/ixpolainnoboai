@@ -65,36 +65,14 @@ from PhysXAI import (
 # ─── Regime inference ────────────────────────────────────────────────────────
 
 def _infer_track_type(batch_list: list) -> str:
-    """Heuristic track-type classification from pred_traj kinematics.
-
-    Uses the best-track future trajectory (batch_list[1]) in normalised space.
-    Sign conventions depend on the dataset normalisation; we use relative
-    displacement direction as a proxy.
-
-    Returns one of: STRAIGHT_WEST, RECURVING_NE, STALLED, POLEWARD_TRACK, MIXED
-    """
-    try:
-        pred = batch_list[1]  # [T_pred, B, 2]  lat/lon normalised
-        if not torch.is_tensor(pred) or pred.ndim < 3:
-            return "MIXED"
-
-        disp = pred[-1, 0] - pred[0, 0]   # total displacement, storm 0
-        dlat = float(disp[0].item())
-        dlon = float(disp[1].item())
-
-        speed = (dlat**2 + dlon**2) ** 0.5
-
-        if speed < 0.05:
-            return "STALLED"
-        if dlat > 0.15 and dlon > 0.05:
-            return "RECURVING_NE"
-        if dlat > 0.10:
-            return "POLEWARD_TRACK"
-        if dlon < -0.05 and abs(dlat) < 0.10:
-            return "STRAIGHT_WEST"
+    """Regime of the best-track future (storm 0): STRAIGHT_WEST | RECURVING_NE |
+    POLEWARD_TRACK | STALLED | MIXED. Degree thresholds are heuristics (PhysXAI/geo.py);
+    coordinates are (lon_n, lat_n), 1 unit = 5 degrees."""
+    from PhysXAI.geo import classify_track_type
+    pred = batch_list[1]  # [T_pred, B, 2]
+    if not torch.is_tensor(pred) or pred.ndim < 3:
         return "MIXED"
-    except Exception:
-        return "MIXED"
+    return classify_track_type(pred[:, 0, :].detach().cpu().numpy())
 
 
 # ─── Single-storm runner ──────────────────────────────────────────────────────

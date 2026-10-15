@@ -68,63 +68,9 @@ _DEFAULT_MODEL_KWARGS = {
 
 
 def _load_model(ckpt_path: str, device: torch.device):
-    """Load TCFlowMatching from a checkpoint, tolerating different key layouts."""
-    from Model.flow_matching_model import TCFlowMatching
-
-    print(f"  Loading checkpoint: {Path(ckpt_path).name}")
-    ckpt = torch.load(ckpt_path, map_location=device)
-
-    # ── Unwrap if the whole checkpoint IS the state-dict ─────────────────────
-    # (some trainers save bare state-dicts without wrapping in a dict of dicts)
-    if all(isinstance(v, torch.Tensor) for v in ckpt.values()):
-        print("  [warn] checkpoint appears to be a bare state-dict — using default model kwargs")
-        state_dict   = ckpt
-        model_kwargs = _DEFAULT_MODEL_KWARGS.copy()
-    else:
-        # Find the state-dict sub-key
-        state_dict = None
-        for k in _MODEL_STATE_KEYS:
-            if k in ckpt:
-                state_dict = ckpt[k]
-                print(f"  State-dict key: '{k}'")
-                break
-        if state_dict is None:
-            raise KeyError(
-                f"Cannot find model weights in checkpoint. "
-                f"Top-level keys: {list(ckpt.keys())}"
-            )
-
-        # Find the model-kwargs sub-key
-        model_kwargs = {}
-        for k in _MODEL_CFG_KEYS:
-            if k in ckpt and isinstance(ckpt[k], dict):
-                model_kwargs = ckpt[k]
-                print(f"  Model kwargs key: '{k}'")
-                break
-        # Also try ckpt["args"] namespace
-        if not model_kwargs and "args" in ckpt:
-            a = ckpt["args"]
-            raw = vars(a) if hasattr(a, "__dict__") else (a if isinstance(a, dict) else {})
-            model_kwargs = {
-                k: raw[k] for k in _DEFAULT_MODEL_KWARGS if k in raw
-            }
-        if not model_kwargs:
-            print("  [warn] no model config found — using default kwargs")
-            model_kwargs = _DEFAULT_MODEL_KWARGS.copy()
-
-    # Keep only keys TCFlowMatching.__init__ actually accepts
-    accepted = set(_DEFAULT_MODEL_KWARGS.keys())
-    model_kwargs = {k: v for k, v in model_kwargs.items() if k in accepted}
-    # Fill in any missing keys with defaults
-    for k, v in _DEFAULT_MODEL_KWARGS.items():
-        model_kwargs.setdefault(k, v)
-
-    model = TCFlowMatching(**model_kwargs)
-    model.load_state_dict(state_dict, strict=False)   # strict=False tolerates minor mismatches
-    model.to(device).eval()
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"  Parameters: {n_params:,}  |  kwargs: {model_kwargs}")
-    return model
+    """Load TC-XFlow via the shared loader (full config + EMA weights)."""
+    from PhysXAI.model_io import load_tcxflow
+    return load_tcxflow(ckpt_path, device)
 
 
 # ── Dataset loader (shared across all seeds) ─────────────────────────────────
@@ -234,43 +180,65 @@ def _run_one_seed(
 # ── Aggregate E1 results across seeds ─────────────────────────────────────────
 
 def _aggregate_e1(per_seed_dfs: list) -> dict:
-    """Compute mean ± std of H-mean-F and per-method metrics across seeds."""
-    import pandas as pd
+    """Aggregate E1 across seeds.
 
+    Per seed, each method's metrics are first averaged over that seed's storms;
+    mean and sample std (ddof=1) are then taken ACROSS SEEDS. Seeds may have a
+    different number of successful storms (failed storms are dropped per seed).
+    Also reports each method's paired difference vs the random-channel floor.
+    """
     if not per_seed_dfs:
         return {}
 
-    numeric_cols = per_seed_dfs[0].select_dtypes(include="number").columns.tolist()
-    stacked = np.stack([df[numeric_cols].values for df in per_seed_dfs], axis=0)  # [S, N, C]
-    mean_vals = stacked.mean(axis=0)
-    std_vals  = stacked.std(axis=0, ddof=1 if len(per_seed_dfs) > 1 else 0)
+    skip = {"storm"}
+    cols = [c for c in per_seed_dfs[0].select_dtypes(include="number").columns if c not in skip]
+    S = len(per_seed_dfs)
+    ddof = 1 if S > 1 else 0
 
-    agg = {}
-    for ci, col in enumerate(numeric_cols):
-        agg[col] = {
-            "mean": float(mean_vals[:, ci].mean()),
-            "std":  float(std_vals[:, ci].mean()),
+    per_method: dict = {}
+    for m in per_seed_dfs[0]["method"].unique():
+        rows = []
+        for df in per_seed_dfs:
+            sub = df[df["method"] == m]
+            if len(sub):
+                rows.append(sub[cols].mean(axis=0, skipna=True).values)
+        if not rows:
+            continue
+        stk = np.stack(rows, axis=0)                      # [S_ok, C]
+        per_method[str(m)] = {
+            "n_seeds": int(stk.shape[0]),
+            "n_storms_per_seed": [int((df["method"] == m).sum()) for df in per_seed_dfs],
+            **{col: {"mean": float(np.nanmean(stk[:, ci])),
+                     "std": float(np.nanstd(stk[:, ci], ddof=ddof)) if stk.shape[0] > 1 else 0.0}
+               for ci, col in enumerate(cols)},
         }
 
-    # Per-row (per method) summary if "method" column exists
-    if "method" in per_seed_dfs[0].columns:
-        per_method: dict[str, dict] = {}
-        methods = per_seed_dfs[0]["method"].unique()
-        for m in methods:
-            rows = [df[df["method"] == m][numeric_cols].values for df in per_seed_dfs]
-            if any(len(r) == 0 for r in rows):
+    rnd = next((m for m in per_method if m.startswith("Random")), None)
+    paired: dict = {}
+    if rnd is not None:
+        for m in per_method:
+            if m == rnd:
                 continue
-            stk = np.stack([r.mean(axis=0) for r in rows], axis=0)  # [S, C]
-            per_method[str(m)] = {
-                col: {"mean": float(stk[:, ci].mean()), "std": float(stk[:, ci].std(ddof=0))}
-                for ci, col in enumerate(numeric_cols)
-            }
-        agg["per_method"] = per_method
+            paired[m] = {}
+            for metric in ("h_score_no_u", "precision_F", "recall_F"):
+                if metric not in cols:
+                    continue
+                diffs = []
+                for df in per_seed_dfs:
+                    a_ = df[df["method"] == m].set_index("storm")[metric]
+                    b_ = df[df["method"] == rnd].set_index("storm")[metric]
+                    d_ = (a_ - b_).dropna()
+                    if len(d_):
+                        diffs.append(float(d_.mean()))
+                if diffs:
+                    paired[m][metric] = {
+                        "mean_diff_vs_random": float(np.mean(diffs)),
+                        "std_across_seeds": float(np.std(diffs, ddof=1)) if len(diffs) > 1 else 0.0,
+                        "per_seed": diffs,
+                    }
 
-    return agg
+    return {"n_seeds": S, "per_method": per_method, "paired_vs_random": paired}
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
@@ -348,8 +316,10 @@ def main():
         with open(agg_path, "w") as f:
             json.dump(agg, f, indent=2)
         print(f"\n[E1] Aggregated report → {agg_path}")
-        if "hmean_f" in agg:
-            print(f"     H-mean-F: {agg['hmean_f']['mean']:.4f} ± {agg['hmean_f']['std']:.4f}")
+        for m, v in agg.get("per_method", {}).items():
+            print(f"     {m:<34} H_mean_F {v['H_mean_F']['mean']:.3f} ± {v['H_mean_F']['std']:.3f}"
+                  f"   h_score_no_u {v['h_score_no_u']['mean']:.3f} ± {v['h_score_no_u']['std']:.3f}"
+                  f"   (seeds={v['n_seeds']})")
 
     # ── Run E2–E8 on seed0 only ─────────────────────────────────────────────
     xai_exps = exps - {"E1"}

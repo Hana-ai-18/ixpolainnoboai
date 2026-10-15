@@ -7,9 +7,17 @@ Standard XAI fidelity metrics measure how well the explanation correlates with
 model behaviour (completeness, faithfulness). For PROBABILISTIC ensemble models
 like TC-XFlow, we need a metric that respects the distributional output.
 
-The Probabilistic Fidelity metric H-mean-F is defined as:
+The Probabilistic Fidelity score `H-mean-F` is defined as:
 
     H-mean-F = 0.4 × Precision-F + 0.4 × Recall-F + 0.2 × Uncertainty-F
+
+NOTE: despite the name this is a WEIGHTED ARITHMETIC mean, not a harmonic
+mean, and Precision-F is an unbounded ratio (CRPS_masked / CRPS_base). Do NOT
+describe it as a harmonic mean in a paper. Uncertainty-F depends only on the
+model's ensemble, not on the explanation, so it adds the same constant to every
+XAI method on a given storm; `h_score_no_u` = (0.4 P + 0.4 R) / 0.8 removes it
+and is the number that actually discriminates between explanation methods.
+The true harmonic H of XAI4Traj (R, P) is computed in Experiments/E9.
 
 where:
 
@@ -43,7 +51,7 @@ import torch
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
-from .utils import crps_ensemble_fast
+from .utils import seed_crn, crps_ensemble_fast
 
 
 @dataclass
@@ -52,12 +60,13 @@ class FidelityResult:
     precision_f:     float   # P_F ∈ [0, ∞)
     recall_f:        float   # R_F ∈ [0, 1]
     uncertainty_f:   float   # U_F ∈ [0, 1]
-    h_mean_f:        float   # H-mean-F = 0.4P + 0.4R + 0.2U ∈ [0, ∞)
+    h_mean_f:        float   # weighted ARITHMETIC score 0.4P + 0.4R + 0.2U ∈ [0, ∞)
     crps_baseline:   float   # unperturbed ensemble CRPS
     crps_masked:     float   # CRPS after masking top-k
     crps_top_k_only: float   # CRPS keeping only top-k
     top_k_channels:  List[int]  # which channels were selected
     interpretation:  str
+    h_score_no_u:    float = float("nan")   # (0.4P + 0.4R)/0.8 — method-discriminating part
 
 
 class ProbabilisticFidelity:
@@ -87,6 +96,7 @@ class ProbabilisticFidelity:
     @torch.no_grad()
     def _run_ensemble(self, batch_list: list, K: int) -> torch.Tensor:
         """Run K ensemble members. Returns [K, T_pred, B, 2]."""
+        seed_crn(0)
         _, _, all_traj = self.model.sample(
             batch_list,
             num_ensemble=K,
@@ -242,6 +252,7 @@ class ProbabilisticFidelity:
             crps_top_k_only=float(crps_topk),
             top_k_channels=top_k_channels,
             interpretation=interp,
+            h_score_no_u=float((0.4 * precision_f + 0.4 * recall_f) / 0.8),
         )
 
     def evaluate_multiple_methods(
